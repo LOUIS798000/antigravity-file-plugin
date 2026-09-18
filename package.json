@@ -1,0 +1,21 @@
+{
+  "name": "antigravity-file-plugin",
+  "version": "1.0.0",
+  "description": "Antigravity 客户端文件拖拽与本地路径辅助工具",
+  "main": "daemon.js",
+  "scripts": {
+    "start": "node daemon.js",
+    "install-autostart": "node install_autostart.js",
+    "uninstall-autostart": "node uninstall_autostart.js",
+    "test:dom": "node test_dom.js",
+    "test:e2e": "node test_e2e.js"
+  },
+  "keywords": [
+    "antigravity",
+    "drag-and-drop",
+    "electron",
+    "cdp"
+  ],
+  "author": "LOUIS798000",
+  "license": "MIT"
+}

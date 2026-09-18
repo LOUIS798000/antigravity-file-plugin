@@ -1,0 +1,5 @@
+node_modules/
+*.log
+chips_preview.png
+.DS_Store
+Thumbs.db
