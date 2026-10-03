@@ -27,7 +27,7 @@ async function main() {
             hasEditable: !!editable,
             hasInput: !!input,
             url: window.location.href,
-            hookInstalled: !!window.__antigravity_drag_drop_hook_v9_installed
+            hookInstalled: !!window.__antigravity_drag_drop_hook_v10_installed
           };
         })()`,
         returnByValue: true

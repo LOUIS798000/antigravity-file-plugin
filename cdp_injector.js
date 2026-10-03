@@ -14,43 +14,71 @@ function getDevToolsPort() {
 
 const HOOK_SCRIPT = `
   (() => {
-    const HOOK_VERSION = 'v9';
-    if (window.__antigravity_drag_drop_hook_v9_installed) return;
-    window.__antigravity_drag_drop_hook_v9_installed = true;
+    const HOOK_VERSION = 'v10';
+    if (window.__antigravity_drag_drop_hook_v10_installed) return;
+    window.__antigravity_drag_drop_hook_v10_installed = true;
     window.__antigravityPathMap = window.__antigravityPathMap || {};
 
     function isAbsoluteFilePath(p) {
       if (!p || typeof p !== 'string') return false;
-      return /^[a-zA-Z]:[\\\\/]/.test(p) || p.startsWith('\\\\\\\\') || p.startsWith('/');
+      return /^[a-zA-Z]:[\\\\/]/.test(p) || p.startsWith('\\\\\\\\');
     }
 
-    // 智能异步解析完整路径（当原生环境未直接提供完整路径时向本地守护服务查询）
-    async function resolvePathAsync(chip, rawName) {
+    // 从当前 DOM 智能提取活跃 Workspace 绝对物理路径
+    function getCurrentWorkspacePath() {
+      try {
+        const uriEl = document.querySelector('[data-uri^="file:///"]');
+        if (uriEl) {
+          const u = uriEl.getAttribute('data-uri');
+          const match = decodeURIComponent(u).match(/^file:\\/\\/\\/([a-zA-Z]:\\/[^?#]+)/i);
+          if (match) {
+            let p = match[1].replace(/\\//g, '\\\\');
+            return p.substring(0, p.lastIndexOf('\\\\'));
+          }
+        }
+      } catch (e) {}
+      return '';
+    }
+
+    // 智能异步解析完整绝对路径（向本地后台守护服务查询，毫秒级定位真实盘符）
+    async function resolvePathAsync(chip, rawName, meta = {}) {
       if (!chip) return;
       const current = chip.getAttribute('data-full-path');
       if (isAbsoluteFilePath(current)) return;
-      if (window.__antigravityPathMap[rawName]) {
+
+      if (window.__antigravityPathMap[rawName] && isAbsoluteFilePath(window.__antigravityPathMap[rawName])) {
         const cached = window.__antigravityPathMap[rawName];
         chip.setAttribute('data-full-path', cached);
-        chip.title = cached;
+        chip.title = '完整本地绝对路径:\\n' + cached;
         return;
       }
+
       try {
-        const res = await fetch('http://127.0.0.1:29888/resolve?name=' + encodeURIComponent(rawName), {
-          signal: AbortSignal.timeout(1500)
+        const wsPath = getCurrentWorkspacePath();
+        const params = new URLSearchParams({
+          name: rawName,
+          size: String(meta.size || 0),
+          lastModified: String(meta.lastModified || 0),
+          dir: meta.isDirectory ? '1' : '0',
+          workspace: wsPath || ''
         });
+
+        const res = await fetch('http://127.0.0.1:29888/resolve?' + params.toString(), {
+          signal: AbortSignal.timeout(2500)
+        });
+
         if (res.ok) {
           const data = await res.json();
-          if (data && data.fullPath && isAbsoluteFilePath(data.fullPath)) {
+          if (data && data.success && data.fullPath && isAbsoluteFilePath(data.fullPath)) {
             chip.setAttribute('data-full-path', data.fullPath);
-            chip.title = data.fullPath;
+            chip.title = '完整本地绝对路径:\\n' + data.fullPath;
             window.__antigravityPathMap[rawName] = data.fullPath;
           }
         }
       } catch (e) {}
     }
 
-    // Polyfill File.prototype.path 针对 Electron 41
+    // Polyfill File.prototype.path 针对 Electron 41-44
     try {
       const getPathFn = (window.webUtils && window.webUtils.getPathForFile) || (window.electronNative && window.electronNative.getPathForFile);
       if (getPathFn && !('path' in File.prototype)) {
@@ -66,7 +94,6 @@ const HOOK_SCRIPT = `
     // 安全彻底清理 Antigravity 原生全屏遮罩与“Drop to add to Agent”虚线框
     function dismissDropOverlay() {
       try {
-        // 派发 mouseup 与 dragleave，促使 React 内置 useDragDetection 的 isDraggedOver 状态立即归零复位
         window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
         window.dispatchEvent(new DragEvent('dragleave', { bubbles: true, relatedTarget: null }));
       } catch (e) {}
@@ -103,7 +130,7 @@ const HOOK_SCRIPT = `
       return null;
     }
 
-    // 核心：Hook Lexical 状态序列化，在发送提问时携带本地路径
+    // 核心：Hook Lexical 状态序列化，在发送提问时附加真实物理绝对路径
     function ensureEditorHooked() {
       const editor = getLexicalEditor();
       if (!editor) return;
@@ -146,7 +173,7 @@ const HOOK_SCRIPT = `
         state.toJSON = function() {
           const json = origToJSON();
           if (json && json.root && Array.isArray(json.root.children)) {
-            // 始终先清理可能存在的旧路径段落，杜绝重复
+            // 清理旧路径段落，避免重复
             json.root.children = json.root.children.filter(p => {
               const textNode = p.children?.find(c => typeof c.text === 'string' && c.text.includes('[附带本地文件/目录路径]:'));
               return !textNode;
@@ -158,7 +185,8 @@ const HOOK_SCRIPT = `
               if (!isAbsoluteFilePath(p) && window.__antigravityPathMap && window.__antigravityPathMap[p]) {
                 p = window.__antigravityPathMap[p];
               }
-              return p;
+              // 关键保障：必须是包含盘符的有效绝对路径才作为绝对路径附加！
+              return isAbsoluteFilePath(p) ? p : null;
             }).filter(Boolean);
 
             if (paths.length > 0) {
@@ -215,8 +243,8 @@ const HOOK_SCRIPT = `
       return customBar;
     }
 
-    // 渲染文件夹卡片：纯文件夹图标 + 目录名称 + 关闭按钮（无 DIR 文本）
-    function renderFolderChip(displayName, fullPath) {
+    // 渲染文件夹卡片：纯文件夹图标 + 目录名称 + 关闭按钮
+    function renderFolderChip(displayName, fullPath, meta = {}) {
       const bar = getOrCreateAttachmentBar();
       if (!bar) return;
 
@@ -224,14 +252,14 @@ const HOOK_SCRIPT = `
       chip.className = 'group relative inline-flex items-center rounded-md border bg-muted border-border select-none transition-all hover:bg-muted/80';
       chip.setAttribute('data-custom-chip', 'true');
       chip.setAttribute('data-full-path', fullPath);
-      chip.title = fullPath;
+      chip.title = isAbsoluteFilePath(fullPath) ? ('完整本地绝对路径:\\n' + fullPath) : displayName;
 
       chip.innerHTML = \`
         <div class="flex h-8 items-center pl-2.5 pr-6 gap-2 cursor-default rounded-md overflow-hidden">
           <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="#f59e0b" stroke="#d97706" stroke-width="1.5" class="shrink-0">
             <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"></path>
           </svg>
-          <span class="text-[11px] font-medium truncate max-w-[120px] text-foreground">\${displayName}</span>
+          <span class="text-[11px] font-medium truncate max-w-[140px] text-foreground">\${displayName}</span>
         </div>
         <button style="position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 9999px; background: transparent; border: none; cursor: pointer;" class="hover:bg-accent/40 text-muted-foreground hover:text-foreground" type="button" aria-label="Remove \${displayName}">
           <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 -960 960 960" fill="currentColor">
@@ -253,12 +281,12 @@ const HOOK_SCRIPT = `
       ensureEditorHooked();
 
       if (!isAbsoluteFilePath(fullPath)) {
-        resolvePathAsync(chip, displayName);
+        resolvePathAsync(chip, displayName, { ...meta, isDirectory: true });
       }
     }
 
     // 渲染通用文件卡片：彩色胶囊徽章 + 文件名称 + 关闭按钮
-    function renderCustomChip(badgeText, badgeBgColor, displayName, fullPath) {
+    function renderCustomChip(badgeText, badgeBgColor, displayName, fullPath, meta = {}) {
       const bar = getOrCreateAttachmentBar();
       if (!bar) return;
 
@@ -266,12 +294,12 @@ const HOOK_SCRIPT = `
       chip.className = 'group relative inline-flex items-center rounded-md border bg-muted border-border select-none transition-all hover:bg-muted/80';
       chip.setAttribute('data-custom-chip', 'true');
       chip.setAttribute('data-full-path', fullPath);
-      chip.title = fullPath;
+      chip.title = isAbsoluteFilePath(fullPath) ? ('完整本地绝对路径:\\n' + fullPath) : displayName;
 
       chip.innerHTML = \`
         <div class="flex h-8 items-center pl-2 pr-6 gap-1.5 cursor-default rounded-md overflow-hidden">
           <div style="background-color: \${badgeBgColor}; color: #ffffff;" class="flex items-center justify-center rounded font-black uppercase tracking-wider px-1.5 h-4 min-w-[24px] text-[8px] leading-none shadow-xs">\${badgeText}</div>
-          <span class="text-[11px] font-medium truncate max-w-[120px] text-foreground">\${displayName}</span>
+          <span class="text-[11px] font-medium truncate max-w-[140px] text-foreground">\${displayName}</span>
         </div>
         <button style="position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 9999px; background: transparent; border: none; cursor: pointer;" class="hover:bg-accent/40 text-muted-foreground hover:text-foreground" type="button" aria-label="Remove \${displayName}">
           <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 -960 960 960" fill="currentColor">
@@ -293,7 +321,7 @@ const HOOK_SCRIPT = `
       ensureEditorHooked();
 
       if (!isAbsoluteFilePath(fullPath)) {
-        resolvePathAsync(chip, displayName);
+        resolvePathAsync(chip, displayName, { ...meta, isDirectory: false });
       }
     }
 
@@ -304,15 +332,16 @@ const HOOK_SCRIPT = `
       // 快捷方式
       if (e === 'lnk' || e === 'url') return { text: e.toUpperCase(), bg: '#4f46e5' };
 
-      // SVG 矢量图专用（橙色）
-      if (e === 'svg') return { text: 'SVG', bg: '#f97316' };
-
-      // 办公文档类（DOCX, DOC, WPS 等）
+      // 文档类
+      if (e === 'pdf') return { text: 'PDF', bg: '#dc2626' };
       if (['doc', 'docx', 'wps', 'rtf', 'odt'].includes(e)) return { text: 'DOC', bg: '#2563eb' };
       if (['xls', 'xlsx', 'et', 'xlsm'].includes(e)) return { text: 'XLS', bg: '#059669' };
       if (['csv', 'tsv'].includes(e)) return { text: e.toUpperCase(), bg: '#059669' };
       if (['ppt', 'pptx', 'dps', 'odp'].includes(e)) return { text: 'PPT', bg: '#ea580c' };
-      if (e === 'pdf') return { text: 'PDF', bg: '#dc2626' };
+
+      // 矢量图与图片
+      if (e === 'svg') return { text: 'SVG', bg: '#f97316' };
+      if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'tiff', 'tif', 'psd'].includes(e)) return { text: 'IMG', bg: '#db2777' };
 
       // 压缩包类
       if (['zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'xz', 'iso', 'cab', 'dmg', 'wim'].includes(e)) {
@@ -347,15 +376,13 @@ const HOOK_SCRIPT = `
       if (e === 'log') return { text: 'LOG', bg: '#52525b' };
       if (['ini', 'env', 'conf', 'config', 'toml', 'properties'].includes(e)) return { text: 'CFG', bg: '#71717a' };
 
-      // 媒体类
+      // 音视频媒体类
       if (['mp4', 'webm', 'mkv', 'avi', 'mov', 'wmv', 'flv'].includes(e)) return { text: 'VIDEO', bg: '#e11d48' };
       if (['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'opus'].includes(e)) return { text: 'AUDIO', bg: '#8b5cf6' };
-      if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'tiff', 'tif', 'psd'].includes(e)) return { text: 'IMG', bg: '#db2777' };
 
       // 可执行程序
       if (['exe', 'msi', 'apk', 'appimage', 'deb', 'rpm', 'dll'].includes(e)) return { text: 'EXE', bg: '#0891b2' };
 
-      // 其它任意有后缀的文件（1~4位字母），自动生成对应的大写徽章
       if (e && e.length <= 4 && /^[a-z0-9]+$/i.test(e)) {
         return { text: e.toUpperCase(), bg: '#64748b' };
       }
@@ -363,13 +390,8 @@ const HOOK_SCRIPT = `
       return { text: 'FILE', bg: '#64748b' };
     }
 
-    // 官方原生严格白名单（绝对排除 docx、svg、xlsx 等会导致报错或崩溃的格式）
-    const STRICT_NATIVE_SUPPORTED_EXTS = new Set([
-      'png', 'jpg', 'jpeg', 'gif', 'webp',
-      'pdf',
-      'txt', 'md', 'json', 'csv', 'py', 'js', 'ts', 'html', 'css',
-      'mp4', 'webm', 'mp3', 'wav'
-    ]);
+    // 原生支持预览的纯图片扩展名
+    const NATIVE_IMAGE_PREVIEW_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
 
     function setupHook() {
       // 阻止 Chromium 默认的文件导航
@@ -394,7 +416,7 @@ const HOOK_SCRIPT = `
         }
       }, true);
 
-      // 监听回车与点击发送，发送后自动清理卡片栏
+      // 发送后自动清理卡片
       function clearCustomChipsAfterSend() {
         setTimeout(() => {
           const chips = document.querySelectorAll('[data-custom-chip="true"]');
@@ -424,20 +446,18 @@ const HOOK_SCRIPT = `
         }
       }, true);
 
-      // 输入框聚焦时确保 Hook 稳固
       window.addEventListener('focusin', () => {
         ensureEditorHooked();
         dismissDropOverlay();
       }, true);
 
-      // 全局拖拽拦截处理
+      // 全局拖拽拦截处理：无论拖入任何文件，一律生成带绝对路径的卡片
       window.addEventListener('drop', (e) => {
         if (!e.isTrusted) return;
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
 
-        // 立即彻底消除遮罩与蓝虚线框
         dismissDropOverlay();
         setTimeout(dismissDropOverlay, 30);
         setTimeout(dismissDropOverlay, 150);
@@ -452,14 +472,14 @@ const HOOK_SCRIPT = `
         if (files.length === 0 && items.length === 0) return;
 
         const fileInput = document.querySelector('input[type="file"]');
-        const nativeAttachFiles = [];
+        const nativePreviewImages = [];
 
         for (let i = 0; i < files.length; i++) {
           const file = files[i];
           const item = items[i];
           const fileName = file.name || 'file';
           
-          // 深度优先提取真实绝对物理路径（支持 Electron 41 webUtils、electronNative、file.path 与本地缓存）
+          // 尝试提取绝对物理路径
           let filePath = '';
           if (window.webUtils && typeof window.webUtils.getPathForFile === 'function') {
             try { filePath = window.webUtils.getPathForFile(file); } catch (err) {}
@@ -467,7 +487,7 @@ const HOOK_SCRIPT = `
           if (!filePath && window.electronNative && typeof window.electronNative.getPathForFile === 'function') {
             try { filePath = window.electronNative.getPathForFile(file); } catch (err) {}
           }
-          if (!filePath && file && file.path) {
+          if (!filePath && file && file.path && isAbsoluteFilePath(file.path)) {
             filePath = file.path;
           }
           if (!filePath && window.__antigravityPathMap && window.__antigravityPathMap[fileName]) {
@@ -480,7 +500,6 @@ const HOOK_SCRIPT = `
           const ext = (fileName.split('.').pop() || '').toLowerCase();
           const isShortcut = ext === 'lnk' || ext === 'url';
 
-          // 快捷方式跳过系统外壳解析，杜绝挂起卡死
           let isDirectory = false;
           if (!isShortcut) {
             try {
@@ -495,38 +514,41 @@ const HOOK_SCRIPT = `
             }
           }
 
-          // 1. 文件夹处理：只显示文件夹图标，不显示 DIR 徽章
+          const fileMeta = {
+            size: file.size || 0,
+            lastModified: file.lastModified || 0,
+            isDirectory
+          };
+
+          // 1. 文件夹：渲染专属文件夹卡片
           if (isDirectory) {
-            renderFolderChip(fileName, filePath);
+            renderFolderChip(fileName, filePath, fileMeta);
             continue;
           }
 
-          // 2. 快捷方式处理：专属 LNK 徽章，不走任何原生处理，绝不卡死
+          // 2. 快捷方式：专属 LNK 徽章卡片
           if (isShortcut) {
-            renderCustomChip(ext.toUpperCase(), '#4f46e5', fileName, filePath);
+            renderCustomChip(ext.toUpperCase(), '#4f46e5', fileName, filePath, fileMeta);
             continue;
           }
 
-          // 3. 检查是否完全适合官方原生机制（仅在严格白名单中且 ≤ 1MB）
-          // DOCX、SVG、XLSX、ZIP、EXE 等绝对不走原生，直接走胶囊卡片，彻底避免 "Unsupported file format" 报错！
-          const isNativeAccepted = STRICT_NATIVE_SUPPORTED_EXTS.has(ext) && file.size <= 1048576;
+          // 3. 所有其它文件（包括 PDF、DOCX、代码、TXT、音视频等）：一律渲染专属彩色胶囊卡片
+          const badgeInfo = getFileBadgeInfo(ext);
+          renderCustomChip(badgeInfo.text, badgeInfo.bg, fileName, filePath, fileMeta);
 
-          if (isNativeAccepted) {
-            nativeAttachFiles.push(file);
-          } else {
-            const badgeInfo = getFileBadgeInfo(ext);
-            renderCustomChip(badgeInfo.text, badgeInfo.bg, fileName, filePath);
+          // 4. 对小体积图片同时推给原生 input，保留官方原生图片预览框
+          if (NATIVE_IMAGE_PREVIEW_EXTS.has(ext) && file.size <= 2097152) {
+            nativePreviewImages.push(file);
           }
         }
 
-        // 确保 Hook 激活
         ensureEditorHooked();
 
-        // 仅把严格白名单中的常规小文件推给原生 input
-        if (nativeAttachFiles.length > 0 && fileInput) {
+        // 仅把纯图片推给原生进行预览
+        if (nativePreviewImages.length > 0 && fileInput) {
           try {
             const dt = new DataTransfer();
-            for (const f of nativeAttachFiles) {
+            for (const f of nativePreviewImages) {
               dt.items.add(f);
             }
             fileInput.files = dt.files;
@@ -544,11 +566,10 @@ const HOOK_SCRIPT = `
       window.__antigravityEnsureEditorHooked = ensureEditorHooked;
       window.__antigravityDismissDropOverlay = dismissDropOverlay;
 
-      // 初始执行一次挂钩与遮罩清理
       ensureEditorHooked();
       dismissDropOverlay();
 
-      console.log('[Antigravity] 拖拽辅助脚本已加载。');
+      console.log('[Antigravity] 拖拽绝对路径增强脚本 (v10) 已就绪。');
     }
 
     setupHook();
@@ -625,7 +646,7 @@ async function installPermanentHook() {
     await cdpCall(ws, 'Page.enable').catch(() => {});
     await cdpCall(ws, 'Page.addScriptToEvaluateOnNewDocument', { source: HOOK_SCRIPT }).catch(() => {});
     await cdpCall(ws, 'Runtime.evaluate', { expression: HOOK_SCRIPT, returnByValue: true });
-    console.log('Hook v9 successfully registered and activated on current page!');
+    console.log('Hook v10 successfully registered and activated on current page!');
   } finally {
     try { ws.close(); } catch {}
   }
